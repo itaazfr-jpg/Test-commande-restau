@@ -93,6 +93,8 @@ textarea::placeholder{color:var(--muted);opacity:.8}
 const norm = s => String(s||'').toLowerCase().normalize('NFD').replace(/\p{M}/gu,'').replace(/[^\p{L}\p{N}]/gu,'');
 const cap = s => { s = s.toLowerCase(); return s.charAt(0).toUpperCase() + s.slice(1); };
 const CONNECT = /(^|\s)(de|du|des|d’|d'|la|le|les|l’|l'|à|au|aux|et|ou|avec|en|sur|sans|par|pour|un|une)$/i;
+const ICON = /[\u2600-\u27BF\u{1F300}-\u{1FAFF}\uE000-\uF8FF]/u;
+const LETTER_MARK = /(?:\s+[FLfl]){1,3}\s*$/;
 function tidy(l){
   return l.replace(/[\u2600-\u27BF\u{1F300}-\u{1FAFF}\uE000-\uF8FF\uFE0F\u2022\u00B7]/gu,' ')
     .replace(/^[^\p{L}\p{N}(«"]+/u,'').replace(/[^\p{L}\p{N})»".!:,]+$/u,'').replace(/\s+/g,' ').trim();
@@ -103,7 +105,8 @@ function isHeading(l){
 }
 function junk(l){
   return !l || /^[\d\s%:.,h]+$/i.test(l) || /cam[ée]ra$/i.test(l) || /\b\d+\s*sur\s*\d+\b/i.test(l)
-    || /(https?:|www\.|\.(it|com|fr|net|org)\b)/i.test(l) || /€|\$|£|\d+[.,]\d{2}\b/.test(l) || /^vari(ety|[ée]t[ée])\s*:/i.test(l);
+    || /(https?:|www\.|\.(it|com|fr|net|org)\b)/i.test(l) || /€|\$|£|\d+[.,]\d{2}\b/.test(l)
+    || /^vari(ety|[ée]t[ée])\s*:/i.test(l) || /^destination dish\b/i.test(l) || /^(du|par le) chef\b/i.test(l);
 }
 function splitName(t){
   t = t.replace(/[\s.:,]+$/,'');
@@ -115,9 +118,31 @@ function splitName(t){
   return detail ? name + ' — ' + detail : name;
 }
 function cleanPaste(raw){
-  const cats = []; let cat = null, cur = null, skip = false, somm = false;
+  // 1) Découpe en lignes utiles : rubriques et lignes de texte (avec repère d’icône ❄/🍃, que Texte en direct lit souvent « F » ou « L »)
+  const toks = []; let somm = false, skip = false;
+  for (const r of raw.split(/\r?\n/)) {
+    let marker = ICON.test(r.replace(/[\s\uFE0F]+$/,'').slice(-3));
+    let l = tidy(r);
+    if (/sommelier/i.test(l)) { somm = true; continue; }
+    if (somm) { if (/€|\$|£|\d+[.,]\d{2}/.test(r)) somm = false; continue; }
+    if (junk(l)) continue;
+    if (isHeading(l)) {
+      skip = /APPARIEMENT|\bVINS?\b|\bWINES?\b|\bCOCKTAILS?\b/i.test(l);
+      if (!skip) toks.push({ h: cap(l.replace(/[\s:]+$/,'')) });
+      continue;
+    }
+    if (skip) continue;
+    if (LETTER_MARK.test(l)) { marker = true; l = l.replace(LETTER_MARK,'').trim(); }
+    if (l) toks.push({ text: l, marker });
+  }
+  // 2) Une rubrique « à repères » : au moins un plat y finit par une icône
+  const maxLen = Math.max(1, ...toks.filter(t => t.text).map(t => t.text.length));
+  let seg = { marks:false }; const segs = [seg];
+  for (const t of toks) { if (t.h) { seg = { marks:false }; segs.push(seg); } else if (t.marker) seg.marks = true; t.seg = seg; }
+  // 3) Recolle les lignes d’un même plat
+  const cats = []; let cat = null, cur = null;
   const flush = () => {
-    if (cur && !cur.orphan && !skip) {
+    if (cur && !cur.orphan) {
       const t = cur.text.trim();
       if (t.length >= 3 && !/[.!?]$/.test(t)) {
         if (!cat) { cat = { name:'', items:[] }; cats.push(cat); }
@@ -126,25 +151,24 @@ function cleanPaste(raw){
     }
     cur = null;
   };
-  for (const r of raw.split(/\r?\n/)) {
-    const l = tidy(r);
-    if (/sommelier/i.test(l)) { flush(); somm = true; continue; }
-    if (somm) { if (/€|\$|£|\d+[.,]\d{2}/.test(r)) somm = false; continue; }
-    if (junk(l)) continue;
-    if (isHeading(l)) {
+  for (const t of toks) {
+    if (t.h) {
       flush();
-      skip = /APPARIEMENT|\bVINS?\b|\bWINES?\b|\bCOCKTAILS?\b/i.test(l);
-      if (!skip) {
-        const name = cap(l.replace(/[\s:]+$/,''));
-        cat = cats.find(c => norm(c.name) === norm(name)) || null;
-        if (!cat) { cat = { name, items:[] }; cats.push(cat); }
-      }
+      cat = cats.find(c => norm(c.name) === norm(t.h)) || null;
+      if (!cat) { cat = { name:t.h, items:[] }; cats.push(cat); }
       continue;
     }
-    if (skip) continue;
-    if (cur && (/^[\p{Ll}(«"]/u.test(l) || /[:,]$/.test(cur.text) || CONNECT.test(cur.text))) { cur.text += ' ' + l; continue; }
+    const l = t.text;
+    let cont = false;
+    if (cur) {
+      const prev = cur.last;
+      if (cur.ended || /[.!?]$/.test(prev)) cont = false;
+      else if (/^[\p{Ll}(«"]/u.test(l) || /[:,]$/.test(prev) || CONNECT.test(prev)) cont = true;
+      else if (t.seg.marks) cont = prev.length >= 0.8 * maxLen;
+    }
+    if (cont) { cur.text += ' ' + l; cur.last = l; cur.ended = t.marker; continue; }
     flush();
-    cur = { text:l, orphan: /^\p{Ll}/u.test(l) };
+    cur = { text:l, last:l, ended:t.marker, orphan: /^\p{Ll}/u.test(l) };
   }
   flush();
   return cats.filter(c => c.items.length);
@@ -191,7 +215,7 @@ function rank(n){
   if (/entree|antipast|starter/.test(n)) return 1;
   if (/premier|primi/.test(n)) return 2;
   if (/principa|second|resistance/.test(n)) return 3;
-  if (/classique|alternati/.test(n)) return 4;
+  if (/classique|alternati/.test(n)) return 6.5;
   if (/fromage/.test(n)) return 5;
   if (/dessert|dolci/.test(n)) return 6;
   if (/boisson/.test(n)) return 7;
